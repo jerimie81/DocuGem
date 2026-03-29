@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef } from 'react';
 import { Download, Wand2, PenTool, Loader2, FileText, CheckCircle2 } from 'lucide-react';
 import SignaturePad from './SignaturePad';
 
@@ -18,16 +18,25 @@ export default function DocumentViewer({ file, onNewFile }: DocumentViewerProps)
   const [clickPos, setClickPos] = useState<{ x: number; y: number } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  const authHeaders = () => {
+    const token = localStorage.getItem('googleAccessToken');
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  };
+
   const handleAnalyze = async (task: string) => {
     setIsAnalyzing(true);
     setAiResult(null);
     try {
       const response = await fetch('/api/ai/process', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({ fileId: file.id, task }),
       });
+
       const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'AI request failed');
+      }
       
       if (task === 'extract_fields') {
         try {
@@ -40,9 +49,9 @@ export default function DocumentViewer({ file, onNewFile }: DocumentViewerProps)
       } else {
         setAiResult(data.result);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Analysis failed:', err);
-      setAiResult('Failed to analyze document.');
+      setAiResult(err?.message || 'Failed to analyze document.');
     } finally {
       setIsAnalyzing(false);
     }
@@ -67,33 +76,27 @@ export default function DocumentViewer({ file, onNewFile }: DocumentViewerProps)
     
     setIsSigning(true);
     try {
-      // For MVP, we assume a standard PDF page size (e.g., 600x800) for coordinates
-      // In a real app, we'd get the actual PDF dimensions
-      const pdfWidth = 600;
-      const pdfHeight = 800;
-      
       const response = await fetch('/api/pdf/sign', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify({
           fileId: file.id,
           signatureBase64: signatureData,
-          x: clickPos.x * pdfWidth,
-          y: clickPos.y * pdfHeight,
+          x: clickPos.x,
+          y: clickPos.y,
           pageIndex: 0,
           scale: 0.3,
         }),
       });
       
       const data = await response.json();
-      if (data.success) {
-        setSignedFileUrl(data.url);
-      } else {
-        alert('Failed to sign document: ' + data.error);
+      if (!response.ok || !data.success) {
+        throw new Error(data.error || 'Failed to sign document');
       }
-    } catch (err) {
+      setSignedFileUrl(data.url);
+    } catch (err: any) {
       console.error('Signing failed:', err);
-      alert('Failed to sign document.');
+      alert(err?.message || 'Failed to sign document.');
     } finally {
       setIsSigning(false);
       setClickPos(null);

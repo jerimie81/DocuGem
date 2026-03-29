@@ -12,6 +12,13 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = 3000;
+const MAX_FILE_SIZE_MB = 10;
+const ALLOWED_MIME_TYPES = [
+  'application/pdf',
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+];
 
 // Middleware
 app.use(express.json({ limit: '50mb' }));
@@ -32,33 +39,72 @@ const storage = multer.diskStorage({
     cb(null, uniqueSuffix + path.extname(file.originalname));
   },
 });
-const upload = multer({ storage });
 
-// Initialize Gemini
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const upload = multer({
+  storage,
+  fileFilter: (_req, file, cb) => {
+    if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
+      return cb(null, true);
+    }
+    cb(new Error('Unsupported file type. Allowed: PDF, PNG, JPG.'));
+  },
+  limits: {
+    fileSize: MAX_FILE_SIZE_MB * 1024 * 1024,
+  },
+});
+
+// Initialize Gemini (API key optional when using Google login bearer tokens)
+const apiKey = process.env.GEMINI_API_KEY;
+if (!apiKey) {
+  console.warn('GEMINI_API_KEY is not set. Will expect an Authorization: Bearer <token> header from Google login.');
+}
+const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
+const DEFAULT_MODEL = 'models/gemini-3.1-flash-preview';
+
+function getCandidateText(response: any) {
+  if (!response) return null;
+  if (typeof response.text === 'string' && response.text.trim()) return response.text;
+  const candidate = response.candidates?.[0];
+  const partText = candidate?.content?.parts?.map((p: any) => p.text).filter(Boolean).join('\n');
+  return partText || null;
+}
 
 // API Routes
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', version: '1.0' });
 });
 
-app.post('/api/upload', upload.single('file'), (req, res) => {
+app.post('/api/upload', upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
   }
+
+  let pageSize;
+  if (req.file.mimetype === 'application/pdf') {
+    try {
+      const pdfDoc = await PDFDocument.load(fs.readFileSync(req.file.path));
+      const firstPage = pdfDoc.getPage(0);
+      pageSize = { width: firstPage.getWidth(), height: firstPage.getHeight() };
+    } catch (err) {
+      console.warn('Failed to read PDF dimensions:', err);
+    }
+  }
+
   res.json({
     id: req.file.filename,
     originalName: req.file.originalname,
     mimetype: req.file.mimetype,
     size: req.file.size,
     url: `/api/file/${req.file.filename}`,
+    pageSize,
   });
 });
 
 app.get('/api/file/:id', (req, res) => {
-  const filePath = path.join(UPLOADS_DIR, req.params.id);
+  const safeId = path.basename(req.params.id);
+  const filePath = path.join(UPLOADS_DIR, safeId);
   if (fs.existsSync(filePath)) {
-    res.sendFile(filePath);
+    res.sendFile(filePath, { headers: { 'Cache-Control': 'no-store' } });
   } else {
     res.status(404).json({ error: 'File not found' });
   }
@@ -69,13 +115,20 @@ app.post('/api/ai/process', async (req, res) => {
     const { fileId, task } = req.body;
     if (!fileId) return res.status(400).json({ error: 'fileId is required' });
 
-    const filePath = path.join(UPLOADS_DIR, fileId);
+    const authHeader = req.headers['authorization'];
+    const hasBearer = typeof authHeader === 'string' && authHeader.startsWith('Bearer ');
+    if (!ai && !hasBearer) {
+      return res.status(503).json({ error: 'AI not configured. Provide GEMINI_API_KEY or send Authorization: Bearer <token> from Google login.' });
+    }
+
+    const filePath = path.join(UPLOADS_DIR, path.basename(fileId));
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ error: 'File not found' });
     }
 
     const fileBuffer = fs.readFileSync(filePath);
-    const mimeType = fileId.endsWith('.pdf') ? 'application/pdf' : 'image/jpeg';
+    const ext = path.extname(fileId).toLowerCase();
+    const mimeType = ext === '.pdf' ? 'application/pdf' : ext === '.png' ? 'image/png' : 'image/jpeg';
     const base64Data = fileBuffer.toString('base64');
 
     let prompt = '';
@@ -87,28 +140,85 @@ app.post('/api/ai/process', async (req, res) => {
       prompt = 'Analyze this document and describe its structure and purpose.';
     }
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.1-flash-preview',
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              data: base64Data,
-              mimeType: mimeType,
+    const responseMimeType = task === 'extract_fields' ? 'application/json' : 'text/plain';
+
+    if (ai && !hasBearer) {
+      const response = await ai.models.generateContent({
+        model: DEFAULT_MODEL,
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                data: base64Data,
+                mimeType: mimeType,
+              },
             },
-          },
-          { text: prompt },
-        ],
-      },
-      config: {
-        responseMimeType: task === 'extract_fields' ? 'application/json' : 'text/plain',
+            { text: prompt },
+          ],
+        },
+        config: {
+          responseMimeType,
+        }
+      });
+
+      const text = getCandidateText(response);
+      if (!text) {
+        return res.status(502).json({ error: 'AI returned no content' });
       }
+
+      return res.json({ result: text });
+    }
+
+    // Fallback: use bearer token from Google login
+    const url = `https://generativelanguage.googleapis.com/v1/${DEFAULT_MODEL}:generateContent`;
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': authHeader as string,
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                inlineData: {
+                  data: base64Data,
+                  mimeType,
+                }
+              }
+            ]
+          },
+          {
+            parts: [{ text: prompt }]
+          }
+        ],
+        generationConfig: {
+          responseMimeType,
+        }
+      }),
     });
 
-    res.json({ result: response.text });
+    const json = await resp.json();
+    if (!resp.ok) {
+      const message = json?.error?.message || 'AI request failed';
+      return res.status(resp.status).json({ error: message });
+    }
+
+    const text = json?.candidates?.[0]?.content?.parts
+      ?.map((p: any) => p?.text)
+      .filter(Boolean)
+      .join('\n');
+
+    if (!text) {
+      return res.status(502).json({ error: 'AI returned no content' });
+    }
+
+    res.json({ result: text });
   } catch (error: any) {
     console.error('AI Processing Error:', error);
-    res.status(500).json({ error: error.message || 'Failed to process document' });
+    const status = error.statusCode || 500;
+    res.status(status).json({ error: error.message || 'Failed to process document' });
   }
 });
 
@@ -120,7 +230,8 @@ app.post('/api/pdf/sign', async (req, res) => {
       return res.status(400).json({ error: 'fileId and signatureBase64 are required' });
     }
 
-    const filePath = path.join(UPLOADS_DIR, fileId);
+    const safeId = path.basename(fileId);
+    const filePath = path.join(UPLOADS_DIR, safeId);
     if (!fs.existsSync(filePath)) {
       return res.status(404).json({ error: 'File not found' });
     }
@@ -145,13 +256,20 @@ app.post('/api/pdf/sign', async (req, res) => {
     }
     
     const page = pages[pageIndex];
+    const pageWidth = page.getWidth();
+    const pageHeight = page.getHeight();
+
+    // Allow normalized coords (0-1) or absolute; normalized is default
+    const isNormalized = x <= 1 && y <= 1;
+    const targetX = isNormalized ? x * pageWidth : x;
+    const targetY = isNormalized ? y * pageHeight : y;
+
     const { width, height } = signatureImage.scale(scale);
 
-    // Apply signature
-    // Note: PDF coordinates start from bottom-left, so we might need to invert Y if frontend sends top-left
+    // Apply signature (PDF origin is bottom-left)
     page.drawImage(signatureImage, {
-      x: x,
-      y: page.getHeight() - y - height, // Convert top-left Y to bottom-left Y
+      x: targetX,
+      y: pageHeight - targetY - height,
       width,
       height,
     });
@@ -159,7 +277,7 @@ app.post('/api/pdf/sign', async (req, res) => {
     const signedPdfBytes = await pdfDoc.save();
     
     // Save as new file
-    const signedFileName = `signed-${Date.now()}-${fileId}`;
+    const signedFileName = `signed-${Date.now()}-${safeId}`;
     const signedFilePath = path.join(UPLOADS_DIR, signedFileName);
     fs.writeFileSync(signedFilePath, signedPdfBytes);
 
@@ -172,6 +290,23 @@ app.post('/api/pdf/sign', async (req, res) => {
     console.error('PDF Signing Error:', error);
     res.status(500).json({ error: error.message || 'Failed to sign PDF' });
   }
+});
+
+// Error handler (must be after routes)
+app.use((err: any, _req: any, res: any, _next: any) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: `File too large. Max ${MAX_FILE_SIZE_MB}MB allowed.` });
+    }
+    return res.status(400).json({ error: err.message || 'Upload failed' });
+  }
+
+  if (typeof err?.message === 'string' && err.message.includes('Unsupported file type')) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  console.error('Unhandled error:', err);
+  return res.status(500).json({ error: err?.message || 'Server error' });
 });
 
 // Vite middleware for development

@@ -10,6 +10,7 @@ export default function FileUploader({ onUploadSuccess }: FileUploaderProps) {
   const [isUploading, setIsUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const MAX_FILE_SIZE_MB = 10;
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -40,6 +41,11 @@ export default function FileUploader({ onUploadSuccess }: FileUploaderProps) {
       return;
     }
 
+    if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
+      setError(`File too large. Max ${MAX_FILE_SIZE_MB}MB.`);
+      return;
+    }
+
     setIsUploading(true);
     setError(null);
 
@@ -52,11 +58,10 @@ export default function FileUploader({ onUploadSuccess }: FileUploaderProps) {
         body: formData,
       });
 
-      if (!response.ok) {
-        throw new Error('Upload failed');
-      }
-
       const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Upload failed');
+      }
       onUploadSuccess(data);
     } catch (err: any) {
       setError(err.message || 'An error occurred during upload.');
